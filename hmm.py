@@ -61,12 +61,9 @@ def maxmul(log_A, log_B):
     Similar to the log domain matrix multiplication,
     this computes out_{i,j} = max_k log_A_{i,k} + log_B_{k,j}
     """
-    m = log_A.shape[0]
-    n = log_A.shape[1]
-    p = log_B.shape[1]
 
-    log_A_expanded = torch.stack([log_A] * p, dim=2)
-    log_B_expanded = torch.stack([log_B] * m, dim=0)
+    log_A_expanded = log_A.unsqueeze(dim=2)
+    log_B_expanded = log_B.unsqueeze(dim=0)
 
     elementwise_sum = log_A_expanded + log_B_expanded
     out1, out2 = torch.max(elementwise_sum, dim=1)
@@ -266,14 +263,9 @@ class HMM(nn.Module):
         log_transition_matrix = func.log_softmax(
             self.transition_model.unnormalized_transition_matrix, dim=1
         )
-        log_emission_matrix = func.log_softmax(
-            self.emission_model.unnormalized_emission_matrix, dim=1
-        )
         for t in range(T_max - 2, -1, -1):
             # Mask to identify which sequences are still active at time t+1
-            mask = (
-                (T > t + 1).float().unsqueeze(1).unsqueeze(2)
-            )  # Shape: (batch_size, 1, 1)
+            mask = (T > t + 1).float()  # Shape: (batch_size, 1, 1)
 
             log_B_t1 = self.emission_model(x[:, t + 1])
             log_B_t1 = log_B_t1.unsqueeze(1)  # (batch_size, 1, N)
@@ -281,9 +273,13 @@ class HMM(nn.Module):
             log_A = log_transition_matrix.unsqueeze(0)  # (1, N, N)
 
             elementwise_sum = log_A + log_B_t1 + log_beta_t1  # (batch_size, N, N)
-            log_beta[:, t, :] = torch.logsumexp(elementwise_sum, dim=2) * mask.squeeze(
-                1
-            ).squeeze(1)  # (batch_size, N)
+            log_sum = torch.logsumexp(elementwise_sum, dim=2)
+            log_sum_masked = torch.where(
+                mask == 1.0,
+                log_sum,
+                torch.full_like(log_sum, -float("inf")),
+            )
+            log_beta[:, t, :] = log_sum_masked
 
         return log_beta
 
@@ -297,12 +293,12 @@ class HMM(nn.Module):
 
         """
         batch_size, T_max, N = log_alpha.shape
-
+        # Computing the log probabilty of the entire observation sequence in the batch
         log_p_x = (
             torch.logsumexp(log_alpha[range(batch_size), T - 1, :], dim=1)
             .unsqueeze(1)
             .unsqueeze(2)
-        )  # (batch_size, T_max, N)
+        )  # (batch_size, 1, 1)
 
         log_gamma = log_alpha + log_beta - log_p_x  # (batch_size, T_max, N)
         gamma = torch.exp(log_gamma)
