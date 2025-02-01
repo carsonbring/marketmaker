@@ -305,6 +305,67 @@ class HMM(nn.Module):
 
         return gamma
 
+    def xi(self, log_alpha, log_beta, x, T):
+        """
+        log_alpha : Tensor of Forward probabilities with shape (batch_size, T_max, num_states)
+        log_beta : Tensor of Backward probabilities with shape (batch_size, T_max, num_states)
+
+        x (IntTensor): Observed sequences with shape (batch_size, T_max).
+        T : Tensor with lengths of each batch with shape (batch_size,)
+
+        Returns Xi: Tensor of probabilies of being in state i at time t and transitioning to another state with shape (batch_size, T_max, num_states, num_states)
+        """
+        log_emission_matrix = (
+            torch.log_softmax(self.emission_model.unnormalized_emission_matrix, dim=0)
+            .unsqueeze(2)
+            .unsqueeze(3)
+        )
+
+        log_transition_matrix = (
+            torch.log_softmax(
+                self.transition_model.unnormalized_transition_matrix, dim=0
+            )
+            .unsqueeze(0)
+            .unsqueeze(0)
+        )
+
+        batch_size, T_max, N = log_alpha.shape
+        log_p_x = (
+            torch.logsumexp(log_alpha[range(batch_size), T - 1, :], dim=1)
+            .unsqueeze(1)
+            .unsqueeze(2)
+            .unsqueeze(3)
+        )
+
+        log_alpha_i = log_alpha.unsqueeze(3)
+        log_emission_expanded = log_emission_matrix.unsqueeze(0).expand(
+            batch_size, -1, -1
+        )
+        indices = x[:, 1:].unsqueeze(1)
+        log_B_t1 = torch.gather(log_emission_expanded, 2, indices)
+        log_B_t1 = log_B_t1.transpose(1, 2).unsqueeze(
+            2
+        )  # (batch_size, T_max-1,1,  num_states)
+
+        log_beta_t1 = log_beta[range(batch_size), 1:, :].unsqueeze(2)
+        terminal_log_beta = torch.zeros(
+            batch_size,
+            1,
+            N,
+            device=log_beta_t1.device,
+            dtype=log_beta_t1.dtype,
+        )
+        terminal_log_B = torch.zeros(
+            batch_size, 1, 1, N, device=log_B_t1.device, dtype=log_B_t1.dtype
+        )
+        log_beta_t1 = torch.cat([log_beta_t1, terminal_log_beta], dim=1)
+        log_B_t1 = torch.cat([log_B_t1, terminal_log_B], dim=1)
+
+        log_xi = log_alpha_i + log_transition_matrix + log_B_t1 + log_beta_t1 - log_p_x
+        xi = torch.exp(log_xi)
+
+        return xi
+
     def baum_welch(self, X, T, num_iterations=10):
         """
         X (List[List[int]] or Tensor): A batch of observation sequences.
