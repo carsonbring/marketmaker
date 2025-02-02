@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as func
@@ -289,7 +290,7 @@ class HMM(nn.Module):
         log_beta : Tensor of Backward probabilities with shape (batch_size, T_max, num_states)
         T : Tensor with lengths of each batch with shape (batch_size,)
 
-        Returns Gamma: Tensor of Posterior probabilies of states with shape (batch_size, T_max, num_states)
+        Returns Log Gamma: Tensor of Posterior probabilies of states with shape (batch_size, T_max, num_states)
 
         """
         batch_size, T_max, N = log_alpha.shape
@@ -301,9 +302,8 @@ class HMM(nn.Module):
         )  # (batch_size, 1, 1)
 
         log_gamma = log_alpha + log_beta - log_p_x  # (batch_size, T_max, N)
-        gamma = torch.exp(log_gamma)
 
-        return gamma
+        return log_gamma
 
     def xi(self, log_alpha, log_beta, x, T):
         """
@@ -313,7 +313,7 @@ class HMM(nn.Module):
         x (IntTensor): Observed sequences with shape (batch_size, T_max).
         T : Tensor with lengths of each batch with shape (batch_size,)
 
-        Returns Xi: Tensor of probabilies of being in state i at time t and transitioning to another state with shape (batch_size, T_max, num_states, num_states)
+        Returns Log Xi: Tensor of probabilies of being in state i at time t and transitioning to another state with shape (batch_size, T_max, num_states, num_states)
         """
         log_emission_matrix = (
             torch.log_softmax(self.emission_model.unnormalized_emission_matrix, dim=0)
@@ -362,9 +362,8 @@ class HMM(nn.Module):
         log_B_t1 = torch.cat([log_B_t1, terminal_log_B], dim=1)
 
         log_xi = log_alpha_i + log_transition_matrix + log_B_t1 + log_beta_t1 - log_p_x
-        xi = torch.exp(log_xi)
 
-        return xi
+        return log_xi
 
     def baum_welch(self, X, T, num_iterations=10):
         """
@@ -373,3 +372,64 @@ class HMM(nn.Module):
         num_iterations (int): Number of EM iterations.
 
         """
+
+        batch_size, T_max = X.shape
+
+        for _ in range(num_iterations):
+            log_alpha = self.forward(X, T)
+            log_beta = self.backward(X, T)
+            gamma = self.gamma(log_alpha, log_beta, T)
+            xi = self.xi(log_alpha, log_beta, X, T)
+            _, _, N, _ = xi.shape
+
+            # Update initial prbabilities
+            self.pi = torch.logsumexp(gamma[:, 0, :], dim=0) - math.log(batch_size)
+
+            # Update Transition matrix
+            # time mask for T[r] -2
+            time_ids = torch.arange(T_max).unsqueeze(0).expand(batch_size, T_max)
+            valid_mask = time_ids < (T - 1).unsqueeze(1)
+            xi_mask = valid_mask.unsqueeze(2).unsqueeze(3).expand(-1, -1, N, N)
+            gamma_mask = valid_mask.unsqueeze(2).expand(-1, -1, N)
+
+            masked_xi = torch.where(
+                xi_mask, xi, torch.tensor(-float("inf"), device=xi.device)
+            )
+            masked_gamma = torch.where(
+                gamma_mask, gamma, torch.tensor(-float("inf"), device=gamma.device)
+            )
+
+            log_xi_sum = torch.logsumexp(torch.logsumexp(masked_xi, dim=1), dim=0)
+            log_gamma_sum = torch.logsumexp(torch.logsumexp(masked_gamma, dim=1), dim=0)
+            self.unnormalized_transition_matrix = log_xi_sum - log_gamma_sum.unsqueeze(
+                1
+            )
+
+            # Update Emission Matrix
+            one_hot_x = func.one_hot(X, num_classes=self.num_observations)
+            time_ids = torch.arange(T_max).unsqueeze(0).expand(batch_size, T_max)
+
+            valid_mask = time_ids < T.unsqueeze(1)
+            gamma_time_mask = valid_mask.unsqueeze(2).expand(-1, -1, N)
+
+            gamma_time_obs_mask = gamma_time_mask & one_hot_x
+
+            masked_gamma_num = torch.where(
+                gamma_time_obs_mask,
+                gamma,
+                torch.tensor(-float("inf"), device=gamma.device),
+            )
+
+            masked_gamma_dem = torch.where(
+                gamma_time_mask,
+                gamma,
+                torch.tensor(-float("inf"), device=gamma.device),
+            )
+            num_gamma_sum = torch.logsumexp(
+                torch.logsumexp(masked_gamma_num, dim=1), dim=0
+            )
+            dem_gamma_sum = torch.logsumexp(
+                torch.logsumexp(masked_gamma_dem, dim=1), dim=0
+            )
+
+            self.unnormalized_emission_matrix = num_gamma_sum - dem_gamma_sum
