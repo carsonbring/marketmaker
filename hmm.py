@@ -80,7 +80,7 @@ class TransitionModel(nn.Module):
 
     def forward(self, log_alpha):
         log_transition_matrix = func.log_softmax(
-            self.unnormalized_transition_matrix, dim=0
+            self.unnormalized_transition_matrix, dim=1
         )
         out = log_domain_matmul(
             log_transition_matrix, log_alpha.transpose(0, 1)
@@ -89,7 +89,7 @@ class TransitionModel(nn.Module):
 
     def maxmul(self, log_alpha):
         log_transition_matrix = torch.nn.functional.log_softmax(
-            self.unnormalized_transition_matrix, dim=0
+            self.unnormalized_transition_matrix, dim=1
         )
         out1, out2 = maxmul(log_transition_matrix, log_alpha.transpose(0, 1))
         return out1.transpose(0, 1), out2.transpose(0, 1)
@@ -124,7 +124,7 @@ class HMM(nn.Module):
     def sample(self, T=10):
         state_priors = nn.functional.softmax(self.pi, dim=0)
         transition_matrix = torch.nn.functional.softmax(
-            self.transition_model.unnormalized_transition_matrix, dim=0
+            self.transition_model.unnormalized_transition_matrix, dim=1
         )
         emission_matrix = torch.nn.functional.softmax(
             self.emission_model.unnormalized_emission_matrix, dim=1
@@ -157,7 +157,7 @@ class HMM(nn.Module):
         T : IntTensor of shape (batch size)
         Find argmax_z log p(x|z) for each (x) in the batch.
         """
-        if self.is_cuda:
+        if next(self.parameters()).is_cuda:
             x = x.cuda()
             T = T.cuda()
         batch_size = x.shape[0]
@@ -165,18 +165,18 @@ class HMM(nn.Module):
         log_state_priors = func.log_softmax(self.pi, dim=0)
         # Delta has the log-probabilities for each step of each batches for each state
         log_delta = torch.full(
-            (batch_size, T_max, self.N), -float("inf"), dtype=torch.float32
+            (batch_size, T_max, self.num_states), -float("inf"), dtype=torch.float32
         )
         # Psi stores the indices of the previous states that led to the current state with the highest prob
-        psi = torch.zeros(batch_size, T_max, self.N).long()
-        if self.is_cuda:
+        psi = torch.zeros(batch_size, T_max, self.num_states).long()
+        if next(self.parameters()).is_cuda:
             log_delta = log_delta.cuda()
             psi = psi.cuda()
         # Intializing log_delta for time step 0 with emission probabilities and state priors
         log_delta[:, 0, :] = self.emission_model(x[:, 0]) + log_state_priors
         for t in range(1, T_max):
             # Computing the maximum log-probability for transitioning to each state from the previous time step (max_val) and the actual index of the probabilities (argmax_val) which acts as the representation of hidden state
-            max_val, argmax_val = self.transitional_model.maxmul(log_delta[:, t - 1, :])
+            max_val, argmax_val = self.transition_model.maxmul(log_delta[:, t - 1, :])
             # Adding that probability of transitioning to the next state to the emission probability of being in said state. Storing the probability for the time step
             # Computing the log-probability of the most probable path that ends in each state at time t
             log_delta[:, t, :] = self.emission_model(x[:, t]) + max_val
@@ -209,7 +209,7 @@ class HMM(nn.Module):
         Returns log p(x).
         T = length of each example
         """
-        if self.is_cuda:
+        if next(self.parameters()).is_cuda:
             x = x.cuda()
             T = T.cuda()
 
@@ -220,7 +220,7 @@ class HMM(nn.Module):
         # Initial probabilities of starting in each state
         log_pi = func.log_softmax(self.pi, dim=0)  # shape: (M,)
         log_alpha = torch.zeros(batch_size, max_time, self.num_states)
-        if self.is_cuda:
+        if next(self.parameters()).is_cuda:
             log_alpha = log_alpha.cuda()
 
         # Initialize alpha[0]
@@ -240,9 +240,9 @@ class HMM(nn.Module):
 
         # P(obs_seq) = logsumexp(alpha[T-1, :])
         # Finding log of the probability of an observation sequence by looking summing at the final timestamp
-        log_sums = log_alpha.logsumexp(dim=2)
-        log_probs = torch.gather(log_sums, 1, T.view(-1, 1) - 1)
-        return log_probs
+        # log_sums = log_alpha.logsumexp(dim=2)
+        # log_probs = torch.gather(log_sums, 1, T.view(-1, 1) - 1)
+        return log_alpha
 
     def backward(self, x, T):
         """
@@ -258,7 +258,7 @@ class HMM(nn.Module):
         )
         log_beta[range(batch_size), T - 1, :] = 0.0
 
-        if self.is_cuda:
+        if next(self.parameters()).is_cuda:
             log_beta = log_beta.cuda()
 
         log_transition_matrix = func.log_softmax(
@@ -316,14 +316,14 @@ class HMM(nn.Module):
         Returns Log Xi: Tensor of probabilies of being in state i at time t and transitioning to another state with shape (batch_size, T_max, num_states, num_states)
         """
         log_emission_matrix = (
-            torch.log_softmax(self.emission_model.unnormalized_emission_matrix, dim=0)
+            torch.log_softmax(self.emission_model.unnormalized_emission_matrix, dim=1)
             .unsqueeze(2)
             .unsqueeze(3)
         )
 
         log_transition_matrix = (
             torch.log_softmax(
-                self.transition_model.unnormalized_transition_matrix, dim=0
+                self.transition_model.unnormalized_transition_matrix, dim=1
             )
             .unsqueeze(0)
             .unsqueeze(0)
@@ -383,7 +383,9 @@ class HMM(nn.Module):
             _, _, N, _ = xi.shape
 
             # Update initial prbabilities
-            self.pi = torch.logsumexp(gamma[:, 0, :], dim=0) - math.log(batch_size)
+            self.pi.data.copy_(
+                torch.logsumexp(gamma[:, 0, :], dim=0) - math.log(batch_size)
+            )
 
             # Update Transition matrix
             # time mask for T[r] -2
@@ -401,22 +403,22 @@ class HMM(nn.Module):
 
             log_xi_sum = torch.logsumexp(torch.logsumexp(masked_xi, dim=1), dim=0)
             log_gamma_sum = torch.logsumexp(torch.logsumexp(masked_gamma, dim=1), dim=0)
-            self.unnormalized_transition_matrix = log_xi_sum - log_gamma_sum.unsqueeze(
-                1
+            self.transition_model.unnormalized_transition_matrix.data.copy_(
+                log_xi_sum - log_gamma_sum.unsqueeze(1)
             )
 
             # Update Emission Matrix
-            one_hot_x = func.one_hot(X, num_classes=self.num_observations)
+            one_hot_x = func.one_hot(X, num_classes=self.num_observations).unsqueeze(2)
             time_ids = torch.arange(T_max).unsqueeze(0).expand(batch_size, T_max)
 
             valid_mask = time_ids < T.unsqueeze(1)
-            gamma_time_mask = valid_mask.unsqueeze(2).expand(-1, -1, N)
+            gamma_time_mask = valid_mask.unsqueeze(2).expand(-1, -1, N).unsqueeze(3)
 
             gamma_time_obs_mask = gamma_time_mask & one_hot_x
 
             masked_gamma_num = torch.where(
                 gamma_time_obs_mask,
-                gamma,
+                gamma.unsqueeze(3),
                 torch.tensor(-float("inf"), device=gamma.device),
             )
 
@@ -432,4 +434,6 @@ class HMM(nn.Module):
                 torch.logsumexp(masked_gamma_dem, dim=1), dim=0
             )
 
-            self.unnormalized_emission_matrix = num_gamma_sum - dem_gamma_sum
+            self.emission_model.unnormalized_emission_matrix.data.copy_(
+                num_gamma_sum - dem_gamma_sum
+            )
