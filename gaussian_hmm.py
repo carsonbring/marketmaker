@@ -4,30 +4,6 @@ import torch.nn as nn
 import torch.nn.functional as func
 
 
-# Gradient optimization
-# def gradient_train_hmm(hmm, sequences, num_epochs=50, lr=1e-2):
-#     """
-#     sequences: a list or tensor of observation sequences.
-#     each sequence is shape (T,) with T being the number of time steps
-#     Each sequence has integer observation indices
-#     """
-#     optimizer = torch.optim.Adam(hmm.parameters(), lr=lr)
-#
-#     for epoch in range(num_epochs):
-#         optimizer.zero_grad()
-#         total_log_prob = 0.0
-#         for seq in sequences:
-#             total_log_prob += hmm.log_likelihood(seq)
-#
-#         loss = -total_log_prob  # negative log-likelihood
-#         loss.backward()  # pyright:ignore
-#         optimizer.step()
-#
-#         print(f"Epoch {epoch}: NLL={loss.item():.3f}")  # pyright:ignore
-#
-#
-
-
 def log_domain_matmul(log_A, log_B):
     """
     log_A : m x n
@@ -104,10 +80,31 @@ class EmissionModel(nn.Module):
         self.cholesky_factors = torch.nn.Parameter(torch.randn(N, D, D))
 
     def forward(self, x_t):
-        print("temp")
-        # log_emission_matrix = func.log_softmax(self.unnormalized_emission_matrix, dim=1)
-        # out = log_emission_matrix[:, x_t].transpose(0, 1)
-        # return out
+        """
+        x_t: Tensor of shape (batch_size, D)
+        Returns: Tensor of shape (batch_size, N) where each entry
+                 [i, j] is the log-probability of observation i under state j.
+        """
+        batch_size = x_t.shape[0]
+        log_c = self.D * math.log(2 * math.pi)
+        L = torch.tril(self.cholesky_factors)
+        diag_L = torch.diagonal(L, offset=0, dim1=-2, dim2=-1)
+        log_diag = torch.log(diag_L)
+        log_det_Sigma = 2 * torch.sum(log_diag, dim=-1)  # (N,)
+
+        # Using Cholesky Decomposition for efficient computation of quadratic
+        delta = x_t.unsqueeze(1) - self.means.unsqueeze(0)
+        delta_reshaped = delta.reshape(-1, self.D).unsqueeze(-1)
+        L_expanded = (
+            L.unsqueeze(0).expand(batch_size, -1, -1, -1).reshape(-1, self.D, self.D)
+        )
+        y_reshaped, _ = torch.triangular_solve(delta_reshaped, L_expanded, upper=False)
+        y = y_reshaped.squeeze(-1).reshape(batch_size, self.N, self.D)
+        quad = torch.sum(y**2, dim=-1)  # (batch_size, N)
+
+        # Gaussian log-likelihood
+        log_p = -0.5 * (log_c + log_det_Sigma.unsqueeze(0) + quad)
+        return log_p
 
 
 class GaussianHMM(nn.Module):
@@ -128,19 +125,17 @@ class GaussianHMM(nn.Module):
         transition_matrix = torch.nn.functional.softmax(
             self.transition_model.unnormalized_transition_matrix, dim=1
         )
-        emission_matrix = torch.nn.functional.softmax(
-            self.emission_model.unnormalized_emission_matrix, dim=1
-        )
         z_t = torch.distributions.categorical.Categorical(state_priors).sample().item()
         z = []
         x = []
         z.append(z_t)
         for t in range(0, T):
-            x_t = (
-                torch.distributions.categorical.Categorical(emission_matrix[z_t])  # pyright: ignore
-                .sample()
-                .item()
-            )
+            mu = self.emission_model.means[int(z_t)]
+            L = torch.tril(self.emission_model.cholesky_factors[int(z_t)])
+            Sigma = L @ L.transpose(-2, -1)
+            dist = torch.distributions.MultivariateNormal(mu, covariance_matrix=Sigma)
+
+            x_t = dist.sample().detach().cpu().numpy()
             x.append(x_t)
 
             z_t = (
@@ -155,7 +150,7 @@ class GaussianHMM(nn.Module):
 
     def viterbi(self, x, T):
         """
-        x : IntTensor of shape (batch size, T_max)
+        x : IntTensor of shape (batch size, T_max, D)
         T : IntTensor of shape (batch size)
         Find argmax_z log p(x|z) for each (x) in the batch.
         """
@@ -181,7 +176,7 @@ class GaussianHMM(nn.Module):
             max_val, argmax_val = self.transition_model.maxmul(log_delta[:, t - 1, :])
             # Adding that probability of transitioning to the next state to the emission probability of being in said state. Storing the probability for the time step
             # Computing the log-probability of the most probable path that ends in each state at time t
-            log_delta[:, t, :] = self.emission_model(x[:, t]) + max_val
+            log_delta[:, t, :] = self.emission_model(x[:, t, :]) + max_val
             # storing each index of the previous state that maximizes the log-prob for each observed state in psi
             psi[:, t, :] = argmax_val
 
@@ -203,9 +198,16 @@ class GaussianHMM(nn.Module):
             z_star.append(z_star_i)
         return z_star, best_path_scores
 
+    def log_likelihood(self, x, T):
+        log_alpha = self.forward(x, T)
+        # Assuming T is a tensor of lengths, gather the log_alpha at the final valid time for each sequence.
+        batch_indices = torch.arange(x.shape[0])
+        final_log_prob = log_alpha[batch_indices, T - 1, :].logsumexp(dim=1)
+        return final_log_prob
+
     def forward(self, x, T):
         """
-        x : IntTensor of shape (batch size, T_max)
+        x : IntTensor of shape (batch size, T_max, D)
         T : IntTensor of shape (batch_size,)
 
         Returns log p(x).
@@ -230,15 +232,15 @@ class GaussianHMM(nn.Module):
         # Adding all prior probs with the emission probs for the first observation.
         # Notice how what would have been multiplying probs turns into adding due to log-space
 
-        log_alpha[:, 0, :] = self.emission_model(x[:, 0]) + log_pi
+        log_alpha[:, 0, :] = self.emission_model(x[:, 0, :]) + log_pi
         # Recursively compute alpha for t=1..T-1
         # Alpha is a tensor representing the log of probs up to time t-1 for each state
         for t in range(1, max_time):
             # alpha_next[i] = logsumexp over j of [alpha[j] + A[j, i]] + B[i, obs[t]]
             # This combines transition and emission probabiilities to compute the state probabilties at each time step
-            log_alpha[:, t, :] = self.emission_model(x[:, t]) + self.transition_model(
-                log_alpha[:, t - 1, :]
-            )
+            log_alpha[:, t, :] = self.emission_model(
+                x[:, t, :]
+            ) + self.transition_model(log_alpha[:, t - 1, :])
 
         # P(obs_seq) = logsumexp(alpha[T-1, :])
         # Finding log of the probability of an observation sequence by looking summing at the final timestamp
@@ -248,13 +250,13 @@ class GaussianHMM(nn.Module):
 
     def backward(self, x, T):
         """
-        x (IntTensor): Observed sequences with shape (batch_size, T_max).
+        x (IntTensor): Observed sequences with shape (batch_size, T_max, D).
         T (IntTensor): Lengths of each sequence with shape (batch_size).
 
         Returns log_beta (Tensor).
         Backward probabilities with shape (batch_size, T_max, num_states).
         """
-        batch_size, T_max = x.shape
+        batch_size, T_max, _ = x.shape
         log_beta = torch.full(
             (batch_size, T_max, self.num_states), -float("inf"), dtype=torch.float32
         )
@@ -270,7 +272,7 @@ class GaussianHMM(nn.Module):
             # Mask to identify which sequences are still active at time t+1
             mask = (T > t + 1).float()  # Shape: (batch_size, 1, 1)
 
-            log_B_t1 = self.emission_model(x[:, t + 1])
+            log_B_t1 = self.emission_model(x[:, t + 1, :])
             log_B_t1 = log_B_t1.unsqueeze(1)  # (batch_size, 1, N)
             log_beta_t1 = log_beta[:, t + 1, :].unsqueeze(1)  # (batch_size, 1, N)
             log_A = log_transition_matrix.unsqueeze(0)  # (1, N, N)
@@ -312,81 +314,61 @@ class GaussianHMM(nn.Module):
         log_alpha : Tensor of Forward probabilities with shape (batch_size, T_max, num_states)
         log_beta : Tensor of Backward probabilities with shape (batch_size, T_max, num_states)
 
-        x (IntTensor): Observed sequences with shape (batch_size, T_max).
+        x (IntTensor): Observed sequences with shape (batch_size, T_max, D).
         T : Tensor with lengths of each batch with shape (batch_size,)
 
         Returns Log Xi: Tensor of probabilies of being in state i at time t and transitioning to another state with shape (batch_size, T_max, num_states, num_states)
         """
-        log_emission_matrix = (
-            torch.log_softmax(self.emission_model.unnormalized_emission_matrix, dim=1)
-            .unsqueeze(2)
-            .unsqueeze(3)
-        )
+        log_B_list = [
+            self.emission_model(x[:, t, :]) for t in range(1, x.shape[1])
+        ]  # Each element in has shape (batch_size, N)
+        # Stack along a new time dimension to get shape (batch_size, T-1, N)
+        log_B = torch.stack(log_B_list, dim=1)
+        # Now unsqueeze to get (batch_size, T-1, 1, N)
+        log_B = log_B.unsqueeze(2)
 
-        log_transition_matrix = (
+        log_A = (
             torch.log_softmax(
                 self.transition_model.unnormalized_transition_matrix, dim=1
             )
             .unsqueeze(0)
             .unsqueeze(0)
-        )
+        )  # (1, 1, N, N)
 
-        batch_size, T_max, N = log_alpha.shape
         log_p_x = (
-            torch.logsumexp(log_alpha[range(batch_size), T - 1, :], dim=1)
+            torch.logsumexp(log_alpha[:, -1, :], dim=1)
             .unsqueeze(1)
             .unsqueeze(2)
             .unsqueeze(3)
         )
 
-        log_alpha_i = log_alpha.unsqueeze(3)
-        log_emission_expanded = log_emission_matrix.unsqueeze(0).expand(
-            batch_size, -1, -1
-        )
-        indices = x[:, 1:].unsqueeze(1)
-        log_B_t1 = torch.gather(log_emission_expanded, 2, indices)
-        log_B_t1 = log_B_t1.transpose(1, 2).unsqueeze(
-            2
-        )  # (batch_size, T_max-1,1,  num_states)
+        log_alpha_i = log_alpha[:, :-1, :].unsqueeze(3)  # (batch_size, T_max-1, N, 1)
+        log_beta_j = log_beta[:, 1:, :].unsqueeze(2)  # (batch_size, T_max-1, 1, N)
 
-        log_beta_t1 = log_beta[range(batch_size), 1:, :].unsqueeze(2)
-        terminal_log_beta = torch.zeros(
-            batch_size,
-            1,
-            N,
-            device=log_beta_t1.device,
-            dtype=log_beta_t1.dtype,
-        )
-        terminal_log_B = torch.zeros(
-            batch_size, 1, 1, N, device=log_B_t1.device, dtype=log_B_t1.dtype
-        )
-        log_beta_t1 = torch.cat([log_beta_t1, terminal_log_beta], dim=1)
-        log_B_t1 = torch.cat([log_B_t1, terminal_log_B], dim=1)
-
-        log_xi = log_alpha_i + log_transition_matrix + log_B_t1 + log_beta_t1 - log_p_x
+        log_xi = log_alpha_i + log_A + log_B + log_beta_j - log_p_x
 
         return log_xi
 
     def baum_welch(self, X, T, num_iterations=10):
         """
-        X (List[List[int]] or Tensor): A batch of observation sequences.
+        X (batch_size, T, D): A batch of observation sequences.
         T (List[int] or Tensor): Lengths of each observation sequence.
         num_iterations (int): Number of EM iterations.
 
         """
 
-        batch_size, T_max = X.shape
+        batch_size, T_max, _ = X.shape
 
         for _ in range(num_iterations):
             log_alpha = self.forward(X, T)
             log_beta = self.backward(X, T)
-            gamma = self.gamma(log_alpha, log_beta, T)
+            log_gamma = self.gamma(log_alpha, log_beta, T)
             xi = self.xi(log_alpha, log_beta, X, T)
             _, _, N, _ = xi.shape
 
             # Update initial prbabilities
             self.pi.data.copy_(
-                torch.logsumexp(gamma[:, 0, :], dim=0) - math.log(batch_size)
+                torch.logsumexp(log_gamma[:, 0, :], dim=0) - math.log(batch_size)
             )
 
             # Update Transition matrix
@@ -400,7 +382,9 @@ class GaussianHMM(nn.Module):
                 xi_mask, xi, torch.tensor(-float("inf"), device=xi.device)
             )
             masked_gamma = torch.where(
-                gamma_mask, gamma, torch.tensor(-float("inf"), device=gamma.device)
+                gamma_mask,
+                log_gamma,
+                torch.tensor(-float("inf"), device=log_gamma.device),
             )
 
             log_xi_sum = torch.logsumexp(torch.logsumexp(masked_xi, dim=1), dim=0)
@@ -409,33 +393,35 @@ class GaussianHMM(nn.Module):
                 log_xi_sum - log_gamma_sum.unsqueeze(1)
             )
 
-            # Update Emission Matrix
-            one_hot_x = func.one_hot(X, num_classes=self.num_observations).unsqueeze(2)
-            time_ids = torch.arange(T_max).unsqueeze(0).expand(batch_size, T_max)
+            # Update Emission Model
+            X_expanded = X.unsqueeze(2)  # (batch_size, T, 1, D)
+            gamma = torch.exp(log_gamma).unsqueeze(3)  # (batch_size, T, N, 1)
+            weighted_sum = (gamma * X_expanded).sum(dim=1)  # (batch_size, N, D)
+            weight_total = gamma.sum(dim=1)  # (batch_size, N, 1)
+            new_means = weighted_sum.sum(dim=0) / weight_total.sum(dim=0)
 
-            valid_mask = time_ids < T.unsqueeze(1)
-            gamma_time_mask = valid_mask.unsqueeze(2).expand(-1, -1, N).unsqueeze(3)
+            self.emission_model.means.data.copy_(new_means)
 
-            gamma_time_obs_mask = gamma_time_mask & one_hot_x
+            delta = X.unsqueeze(2) - self.emission_model.means.unsqueeze(
+                0
+            )  # (batch_size,T, N, D)
+            delta_expanded = delta.unsqueeze(-1)  # shape: (batch_size, T, N, D, 1)
+            delta_t_expanded = delta.unsqueeze(-2)  # shape: (batch_size, T, N, 1, D)
+            outer_product = torch.matmul(
+                delta_expanded, delta_t_expanded
+            )  # shape: (batch_size, T, N, D, D)
 
-            masked_gamma_num = torch.where(
-                gamma_time_obs_mask,
-                gamma.unsqueeze(3),
-                torch.tensor(-float("inf"), device=gamma.device),
-            )
+            new_covariance = (gamma.unsqueeze(-1) * outer_product).sum(
+                dim=1
+            ) / weight_total.unsqueeze(-1)  # shape: (batch_size, N, D, D)
 
-            masked_gamma_dem = torch.where(
-                gamma_time_mask,
-                gamma,
-                torch.tensor(-float("inf"), device=gamma.device),
+            # TODO: Evaluate if I want to sum here
+            new_covariance_avg = new_covariance.mean(dim=0)  # shape: (N, D, D)
+            # Ensuring strictly positive definite for covariance avg
+            jitter = 1e-6 * torch.eye(
+                self.emission_model.D, device=new_covariance_avg.device
             )
-            num_gamma_sum = torch.logsumexp(
-                torch.logsumexp(masked_gamma_num, dim=1), dim=0
-            )
-            dem_gamma_sum = torch.logsumexp(
-                torch.logsumexp(masked_gamma_dem, dim=1), dim=0
-            )
+            new_covariance_avg = new_covariance_avg + jitter.unsqueeze(0)
 
-            self.emission_model.unnormalized_emission_matrix.data.copy_(
-                num_gamma_sum - dem_gamma_sum
-            )
+            new_cholesky = torch.linalg.cholesky(new_covariance_avg)  # shape: (N, D, D)
+            self.emission_model.cholesky_factors.data.copy_(new_cholesky)
