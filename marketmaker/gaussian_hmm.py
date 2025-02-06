@@ -297,7 +297,7 @@ class GaussianHMM(nn.Module):
         Returns Log Gamma: Tensor of Posterior probabilies of states with shape (batch_size, T_max, num_states)
 
         """
-        batch_size, T_max, N = log_alpha.shape
+        batch_size, _, _ = log_alpha.shape
         # Computing the log probabilty of the entire observation sequence in the batch
         log_p_x = (
             torch.logsumexp(log_alpha[range(batch_size), T - 1, :], dim=1)

@@ -1,14 +1,17 @@
-import math
-from re import split
 import torch
-import torch.nn as nn
-import torch.nn.functional as func
 import requests
-from dotenv import load_dotenv
-from torch.serialization import load
+from pydantic import BaseSettings
 import os
 import pandas
 import pickle
+
+
+class Settings(BaseSettings):
+    av_key: str
+    debug: bool = False
+
+    class Config:
+        env_file = ".env"
 
 
 def retrieve_data(ticker: str):
@@ -16,13 +19,14 @@ def retrieve_data(ticker: str):
     Output: dataframe output of output
     """
 
+    settings = Settings()
+
     if os.path.exists("data.pkl"):
         with open("data.pkl", "rb") as f:
             df = pickle.load(f)
 
     else:
-        load_dotenv()
-        av_key = os.getenv("AV_API_KEY")
+        av_key = settings.av_key
         url = f"https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol={ticker}&apikey={av_key}&outputsize=full"
         r = requests.get(url)
         data = r.json()
