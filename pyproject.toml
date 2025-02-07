@@ -11,6 +11,8 @@ torch = "^2.6.0"
 pandas = "^2.2.3"
 requests = "^2.32.3"
 pydantic = "^2.10.6"
+pydantic-settings = "^2.7.1"
+debugpy = "^1.8.12"
 
 
 [build-system]

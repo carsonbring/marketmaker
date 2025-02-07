@@ -1,13 +1,13 @@
 import torch
 import requests
-from pydantic import BaseSettings
+from pydantic_settings import BaseSettings
 import os
 import pandas
 import pickle
 
 
 class Settings(BaseSettings):
-    av_key: str
+    av_key: str = "default_api_key"
     debug: bool = False
 
     class Config:
@@ -18,7 +18,6 @@ def retrieve_data(ticker: str):
     """
     Output: dataframe output of output
     """
-
     settings = Settings()
 
     if os.path.exists("data.pkl"):
@@ -51,6 +50,7 @@ def tensor_convert(df: pandas.DataFrame):
     batch_tensor = torch.cat(t_list[:-1], dim=0)
     print("Batch tensor shape: ", batch_tensor.shape)
     print(batch_tensor)
+    return batch_tensor
 
 
 def split_dataframe(df, chunk_size=365):
