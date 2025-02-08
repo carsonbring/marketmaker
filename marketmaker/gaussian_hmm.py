@@ -109,6 +109,10 @@ class EmissionModel(nn.Module):
         L_expanded = (
             L.unsqueeze(0).expand(batch_size, -1, -1, -1).reshape(-1, self.D, self.D)
         )
+        # print("x_t range:", x_t.min().item(), x_t.max().item())
+        # print("means range:", self.means.min().item(), self.means.max().item())
+        # print("delta range:", delta.min().item(), delta.max().item())
+
         y_reshaped = torch.linalg.solve_triangular(
             L_expanded, delta_reshaped, upper=False
         )
@@ -320,6 +324,9 @@ class GaussianHMM(nn.Module):
             .unsqueeze(1)
             .unsqueeze(2)
         )  # (batch_size, 1, 1)
+        print(log_alpha.shape)
+        print(log_beta.shape)
+        print(log_p_x.shape)
 
         log_gamma = log_alpha + log_beta - log_p_x  # (batch_size, T_max, N)
 
@@ -373,17 +380,27 @@ class GaussianHMM(nn.Module):
 
         """
 
+        batch_size, T_max, _ = X.shape
+
+        # Initializing means
+        # TODO: Change to k-Means
+        x_flat = X.float().reshape(-1, X.shape[-1])
+        indices = torch.randperm(x_flat.shape[0])[: self.num_states]
+        initial_means = x_flat[indices]
+        self.emission_model.means.data.copy_(initial_means)
+
         if next(self.parameters()).is_cuda:
             X = X.to(next(self.parameters()).device)
             T = T.to(next(self.parameters()).device)
 
-        batch_size, T_max, _ = X.shape
         prev_log_likelihood = -float("inf")
 
         for i in range(num_iterations):
             log_alpha = self.forward(X, T)
             log_beta = self.backward(X, T)
             log_gamma = self.gamma(log_alpha, log_beta, T)
+            gamma_exp = torch.exp(log_gamma)
+            print(gamma_exp.sum(dim=2))
             xi = self.xi(log_alpha, log_beta, X, T)
             _, _, N, _ = xi.shape
 
@@ -430,10 +447,19 @@ class GaussianHMM(nn.Module):
             )
 
             # Update Emission Model
-            X_expanded = X.unsqueeze(2)  # (batch_size, T, 1, D)
             gamma = torch.exp(log_gamma).unsqueeze(3)  # (batch_size, T, N, 1)
-            weighted_sum = (gamma * X_expanded).sum(dim=1)  # (batch_size, N, D)
-            weight_total = gamma.sum(dim=1)  # (batch_size, N, 1)
+            time_ids = torch.arange(T_max, device=T.device).unsqueeze(0)  # (1, T_max)
+            time_mask = (
+                (time_ids < T.unsqueeze(1)).unsqueeze(2).unsqueeze(3)
+            )  # (batch_size, T, 1, 1)
+
+            masked_gamma = torch.where(
+                time_mask, gamma, torch.tensor(0.0, device=gamma.device)
+            )
+
+            X_expanded = X.unsqueeze(2)  # (batch_size, T, 1, D)
+            weighted_sum = (masked_gamma * X_expanded).sum(dim=1)  # (batch_size, N, D)
+            weight_total = masked_gamma.sum(dim=1)  # (batch_size, N, 1)
             new_means = weighted_sum.sum(dim=0) / weight_total.sum(dim=0)
 
             self.emission_model.means.data.copy_(new_means)
@@ -447,9 +473,11 @@ class GaussianHMM(nn.Module):
                 delta_expanded, delta_t_expanded
             )  # shape: (batch_size, T, N, D, D)
 
-            new_covariance = (gamma.unsqueeze(-1) * outer_product).sum(
-                dim=1
-            ) / weight_total.unsqueeze(-1)  # shape: (batch_size, N, D, D)
+            masked_outer_product = masked_gamma.unsqueeze(-1) * outer_product
+
+            new_covariance = masked_outer_product.sum(dim=1) / weight_total.unsqueeze(
+                -1
+            )  # shape: (batch_size, N, D, D)
 
             new_covariance_sum = new_covariance.sum(dim=0)  # shape: (N, D, D)
             # Ensuring strictly positive definite for covariance avg
