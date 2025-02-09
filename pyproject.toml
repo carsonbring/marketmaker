@@ -13,6 +13,7 @@ requests = "^2.32.3"
 pydantic = "^2.10.6"
 pydantic-settings = "^2.7.1"
 debugpy = "^1.8.12"
+matplotlib = "^3.10.0"
 
 
 [build-system]

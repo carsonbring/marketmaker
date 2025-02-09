@@ -53,5 +53,20 @@ def tensor_convert(df: pandas.DataFrame):
     return batch_tensor
 
 
+def normalize_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    bsize, T_max, D = tensor.shape
+    flattened = tensor.reshape(-1, D).float()
+
+    mean = flattened.mean(dim=0)
+    std = flattened.std(dim=0)
+    eps = 1e-8
+    std[std < eps] = 1.0
+
+    flattened_normalized = (flattened - mean) / std
+
+    tensor_norm = flattened_normalized.reshape(bsize, T_max, D)
+    return tensor_norm
+
+
 def split_dataframe(df, chunk_size=365):
     return [df.iloc[:, i : i + chunk_size] for i in range(0, df.shape[1], chunk_size)]

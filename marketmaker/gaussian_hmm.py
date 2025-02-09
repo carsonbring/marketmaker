@@ -2,6 +2,8 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as func
+import matplotlib.pyplot as plt
+import numpy as np
 
 
 def log_domain_matmul(log_A, log_B):
@@ -210,7 +212,7 @@ class GaussianHMM(nn.Module):
             z_star_i = [log_delta[i, T[i] - 1, :].max(dim=0)[1].item()]
             # Going back through the time steps and assembling the most likely hidden states based on the last state probability and the backpointer matrix
             for t in range(T[i] - 1, 0, -1):
-                z_t = psi[i, t, z_star_i[0]].item()
+                z_t = psi[i, t, z_star_i[0]].item()  # pyright: ignore
                 z_star_i.insert(0, z_t)
             z_star.append(z_star_i)
         return z_star, best_path_scores
@@ -324,9 +326,9 @@ class GaussianHMM(nn.Module):
             .unsqueeze(1)
             .unsqueeze(2)
         )  # (batch_size, 1, 1)
-        print(log_alpha.shape)
-        print(log_beta.shape)
-        print(log_p_x.shape)
+        # print(log_alpha.shape)
+        # print(log_beta.shape)
+        # print(log_p_x.shape)
 
         log_gamma = log_alpha + log_beta - log_p_x  # (batch_size, T_max, N)
 
@@ -372,7 +374,7 @@ class GaussianHMM(nn.Module):
 
         return log_xi
 
-    def baum_welch(self, X, T, num_iterations=100, threshold=1e-4) -> str:
+    def baum_welch(self, X, T, num_iterations=150, threshold=1e-4) -> str:
         """
         X (batch_size, T, D): A batch of observation sequences.
         T (List[int] or Tensor): Lengths of each observation sequence.
@@ -381,6 +383,7 @@ class GaussianHMM(nn.Module):
         """
 
         batch_size, T_max, _ = X.shape
+        log_likelihoods = []
 
         # Initializing means
         # TODO: Change to k-Means
@@ -400,7 +403,7 @@ class GaussianHMM(nn.Module):
             log_beta = self.backward(X, T)
             log_gamma = self.gamma(log_alpha, log_beta, T)
             gamma_exp = torch.exp(log_gamma)
-            print(gamma_exp.sum(dim=2))
+            # print(gamma_exp.sum(dim=2))
             xi = self.xi(log_alpha, log_beta, X, T)
             _, _, N, _ = xi.shape
 
@@ -475,9 +478,10 @@ class GaussianHMM(nn.Module):
 
             masked_outer_product = masked_gamma.unsqueeze(-1) * outer_product
 
-            new_covariance = masked_outer_product.sum(dim=1) / weight_total.unsqueeze(
-                -1
+            new_covariance = masked_outer_product.sum(dim=1) / (
+                weight_total.unsqueeze(-1) + 1e-6
             )  # shape: (batch_size, N, D, D)
+            # print("New_covariance shape: ", new_covariance.shape)
 
             new_covariance_sum = new_covariance.sum(dim=0)  # shape: (N, D, D)
             # Ensuring strictly positive definite for covariance avg
@@ -489,10 +493,27 @@ class GaussianHMM(nn.Module):
             new_cholesky = torch.linalg.cholesky(new_covariance_sum)  # shape: (N, D, D)
             self.emission_model.cholesky_factors.data.copy_(new_cholesky)
 
-            new_log_likelihood = self.log_likelihood(log_alpha, T)
+            new_log_likelihood = self.log_likelihood(log_alpha, T).mean().item()
+            log_likelihoods.append(new_log_likelihood)
 
-            if abs(new_log_likelihood.mean().item() - prev_log_likelihood) < threshold:
-                return f"Converged after {i} iterations"
+            if abs(new_log_likelihood - prev_log_likelihood) < threshold:
+                break
 
-            prev_log_likelihood = new_log_likelihood.mean().item()
-        return f"Finished {num_iterations} iterations of Baum Welch with a log_likelihood of {new_log_likelihood}"
+            prev_log_likelihood = new_log_likelihood
+
+        overall_mean = np.mean(log_likelihoods)
+        plt.figure(figsize=(8, 6))
+        plt.plot(log_likelihoods, marker="o", label="Mean Log-Likelihood")
+        plt.axhline(
+            y=float(overall_mean),
+            color="r",
+            linestyle="--",
+            label=f"Overall Mean = {overall_mean:.2f}",
+        )
+        plt.xlabel("Iteration")
+        plt.ylabel("Mean Log-Likelihood")
+        plt.title("Baum-Welch Convergence")
+        plt.legend()
+        plt.grid(True)
+        plt.show()
+        return f"Finished {i+1} iterations of Baum Welch with a final log_likelihood of {new_log_likelihood}"  # pyright: ignore

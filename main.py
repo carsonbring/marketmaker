@@ -1,9 +1,10 @@
-from marketmaker import GaussianHMM, tensor_convert, retrieve_data
+from marketmaker import GaussianHMM, tensor_convert, retrieve_data, normalize_tensor
 import torch
 
 
 def main():
     tensor = tensor_convert(retrieve_data("TSLA"))
+    norm_tensor = normalize_tensor(tensor)
     ghmm = GaussianHMM(
         5,
         5,
@@ -14,7 +15,7 @@ def main():
     print(f"Using device: {device}")
     ghmm = ghmm.to(device)
 
-    response = ghmm.baum_welch(tensor, T)
+    response = ghmm.baum_welch(norm_tensor, T)
 
     print(response)
 
