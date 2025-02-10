@@ -1,4 +1,5 @@
 import math
+from re import A
 import torch
 import torch.nn as nn
 import torch.nn.functional as func
@@ -217,10 +218,24 @@ class GaussianHMM(nn.Module):
             z_star.append(z_star_i)
         return z_star, best_path_scores
 
-    def log_likelihood(self, log_alpha, T):
+    def log_likelihood(self, log_alpha, log_scales, T):
+        """
+        log_alpha: (batch_size, T_max, num_states)
+        log_scales: (batch_size, T_max)
+        T: (batch_size,)
+
+        Returns log_probs: (batch_size,) log-likelihood of each sequence
+        """
+        batch_size = log_alpha.shape[0]
+
         # Assuming T is a tensor of lengths, gather the log_alpha at the final valid time for each sequence.
         batch_indices = torch.arange(log_alpha.shape[0])
-        final_log_prob = log_alpha[batch_indices, T - 1, :].logsumexp(dim=1)
+        final_log_alpha = log_alpha[batch_indices, T - 1, :]
+        sum_of_scales = torch.zeros_like(T, dtype=torch.float)
+        for b in range(batch_size):
+            sum_of_scales[b] = torch.sum(log_scales[b, : T[b]])
+        final_log_prob = torch.logsumexp(final_log_alpha, dim=1)
+
         return final_log_prob
 
     def forward(self, x, T):
@@ -242,6 +257,7 @@ class GaussianHMM(nn.Module):
         # Initial probabilities of starting in each state
         log_pi = func.log_softmax(self.pi, dim=0)  # shape: (M,)
         log_alpha = torch.zeros(batch_size, max_time, self.num_states)
+        log_scales = torch.zeros(batch_size, max_time)
         if next(self.parameters()).is_cuda:
             log_alpha = log_alpha.cuda()
 
@@ -251,6 +267,9 @@ class GaussianHMM(nn.Module):
         # Notice how what would have been multiplying probs turns into adding due to log-space
 
         log_alpha[:, 0, :] = self.emission_model(x[:, 0, :]) + log_pi
+        scale_t0 = torch.logsumexp(log_alpha[:, 0, :], dim=1, keepdim=True)
+        log_alpha[:, 0, :] -= scale_t0
+        log_scales[:, 0] = scale_t0.squeeze(-1)
         # Recursively compute alpha for t=1..T-1
         # Alpha is a tensor representing the log of probs up to time t-1 for each state
         for t in range(1, max_time):
@@ -259,12 +278,15 @@ class GaussianHMM(nn.Module):
             log_alpha[:, t, :] = self.emission_model(
                 x[:, t, :]
             ) + self.transition_model(log_alpha[:, t - 1, :])
+            scale_t = torch.logsumexp(log_alpha[:, t, :], dim=1, keepdim=True)
+            log_alpha[:, t, :] -= scale_t
+            log_scales[:, t] = scale_t.squeeze(-1)
 
         # P(obs_seq) = logsumexp(alpha[T-1, :])
         # Finding log of the probability of an observation sequence by looking summing at the final timestamp
         # log_sums = log_alpha.logsumexp(dim=2)
         # log_probs = torch.gather(log_sums, 1, T.view(-1, 1) - 1)
-        return log_alpha
+        return log_alpha, log_scales
 
     def backward(self, x, T):
         """
@@ -399,7 +421,7 @@ class GaussianHMM(nn.Module):
         prev_log_likelihood = -float("inf")
 
         for i in range(num_iterations):
-            log_alpha = self.forward(X, T)
+            log_alpha, log_scales = self.forward(X, T)
             log_beta = self.backward(X, T)
             log_gamma = self.gamma(log_alpha, log_beta, T)
             gamma_exp = torch.exp(log_gamma)
@@ -485,7 +507,7 @@ class GaussianHMM(nn.Module):
 
             new_covariance_sum = new_covariance.sum(dim=0)  # shape: (N, D, D)
             # Ensuring strictly positive definite for covariance avg
-            jitter = 1e-6 * torch.eye(
+            jitter = 1e-4 * torch.eye(
                 self.emission_model.D, device=new_covariance_sum.device
             )
             new_covariance_sum = new_covariance_sum + jitter.unsqueeze(0)
@@ -493,7 +515,9 @@ class GaussianHMM(nn.Module):
             new_cholesky = torch.linalg.cholesky(new_covariance_sum)  # shape: (N, D, D)
             self.emission_model.cholesky_factors.data.copy_(new_cholesky)
 
-            new_log_likelihood = self.log_likelihood(log_alpha, T).mean().item()
+            new_log_likelihood = (
+                self.log_likelihood(log_alpha, log_scales, T).mean().item()
+            )
             log_likelihoods.append(new_log_likelihood)
 
             if abs(new_log_likelihood - prev_log_likelihood) < threshold:
@@ -501,6 +525,11 @@ class GaussianHMM(nn.Module):
 
             prev_log_likelihood = new_log_likelihood
 
+        next_state_probs = self.one_step_ahead_forecast(log_alpha, log_scales, T)  # pyright:ignore
+
+        prediction = self.forecast_observation(
+            next_state_probs, self.emission_model.means
+        )
         overall_mean = np.mean(log_likelihoods)
         plt.figure(figsize=(8, 6))
         plt.plot(log_likelihoods, marker="o", label="Mean Log-Likelihood")
@@ -516,4 +545,51 @@ class GaussianHMM(nn.Module):
         plt.legend()
         plt.grid(True)
         plt.show()
-        return f"Finished {i+1} iterations of Baum Welch with a final log_likelihood of {new_log_likelihood}"  # pyright: ignore
+        return f"Finished {i+1} iterations of Baum Welch with a final log_likelihood of {new_log_likelihood}. Prediction for next day: {prediction} \n Next state probs {next_state_probs}"  # pyright: ignore
+
+    def one_step_ahead_forecast(self, log_alpha, log_scales, T):
+        """
+        Computes the one-step-ahead forecast state distribution.
+
+        log_alpha: Tensor of shape (batch_size, T_max, num_states) containing log forward probs
+        T
+        transition_matrix
+
+        Returns next_state_probs (batch_size, n_states) representing the forecast state distribution for time T+1.
+        """
+        batch_size = log_alpha.shape[0]
+
+        batch_indices = torch.arange(batch_size)
+        final_log_alpha = log_alpha[
+            batch_indices, T - 1, :
+        ]  # Shape: (batch_size, n_states)
+        # TODO: REvisit
+        sum_of_scales = torch.zeros(
+            batch_size, dtype=torch.float, device=next(self.parameters()).device
+        )
+        for b in range(batch_size):
+            sum_of_scales[b] = torch.sum(log_scales[b, : T[b]])
+
+        final_log_probs = sum_of_scales.unsqueeze(1) + final_log_alpha
+
+        final_probs = final_log_probs.exp()  # Shape: (batch_size, n_states)
+
+        next_state_probs = torch.matmul(
+            final_probs, self.transition_model.unnormalized_transition_matrix
+        )  # Shape: (batch_size, n_states)
+
+        return next_state_probs
+
+    def forecast_observation(self, next_state_probs, state_means):
+        """
+        Computes the forecasted observation as a weighted sum of the state means.
+
+        next_state_probs: (batch_size, n_states)
+        state_means: (n_states, D)
+
+        Returns forecast_obs representing expected observation for time T+1.
+        """
+        forecast_obs = torch.sum(
+            next_state_probs.unsqueeze(-1) * state_means.unsqueeze(0), dim=1
+        )
+        return forecast_obs

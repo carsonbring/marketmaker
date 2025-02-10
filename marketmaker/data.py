@@ -38,6 +38,7 @@ def retrieve_data(ticker: str):
 
 
 def tensor_convert(df: pandas.DataFrame):
+    print(df)
     t_list = []
     df_list = split_dataframe(df)
     for df in df_list:
@@ -46,8 +47,15 @@ def tensor_convert(df: pandas.DataFrame):
         tensor = tensor.T
         tensor = tensor.unsqueeze(0)
         t_list.append(tensor)
+    # open, high, low, close, volume
 
     batch_tensor = torch.cat(t_list[:-1], dim=0)
+    batch_tensor[:, :, 0] = (
+        batch_tensor[:, :, 3] - batch_tensor[:, :, 0]
+    ) / batch_tensor[:, :, 0]
+
+    batch_tensor = batch_tensor[:, :, [0]]
+
     print("Batch tensor shape: ", batch_tensor.shape)
     print(batch_tensor)
     return batch_tensor

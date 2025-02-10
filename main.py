@@ -7,7 +7,7 @@ def main():
     norm_tensor = normalize_tensor(tensor)
     ghmm = GaussianHMM(
         5,
-        5,
+        2,
     )
     T = torch.full((10,), 365)
 
@@ -15,9 +15,8 @@ def main():
     print(f"Using device: {device}")
     ghmm = ghmm.to(device)
 
-    response = ghmm.baum_welch(norm_tensor, T)
-
-    print(response)
+    baum_welch_response = ghmm.baum_welch(norm_tensor, T)
+    print(baum_welch_response)
 
 
 if __name__ == "__main__":
