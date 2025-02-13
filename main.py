@@ -4,10 +4,10 @@ import torch
 
 def main():
     tensor = tensor_convert(retrieve_data("TSLA"))
-    norm_tensor = normalize_tensor(tensor)
+    norm_tensor, mean, std = normalize_tensor(tensor)
     ghmm = GaussianHMM(
         5,
-        2,
+        1,
     )
     T = torch.full((10,), 365)
 
@@ -15,9 +15,9 @@ def main():
     print(f"Using device: {device}")
     ghmm = ghmm.to(device)
 
-    baum_welch_response = ghmm.baum_welch(norm_tensor, T)
+    baum_welch_response = ghmm.baum_welch(norm_tensor, T, mean, std)
     print(baum_welch_response)
 
 
 if __name__ == "__main__":
-    main()
+    exit(main())

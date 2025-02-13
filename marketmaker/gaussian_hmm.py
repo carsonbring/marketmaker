@@ -269,6 +269,7 @@ class GaussianHMM(nn.Module):
         log_alpha[:, 0, :] = self.emission_model(x[:, 0, :]) + log_pi
         scale_t0 = torch.logsumexp(log_alpha[:, 0, :], dim=1, keepdim=True)
         log_alpha[:, 0, :] -= scale_t0
+        # TODO : Come check out why the log scales are so big? They prevent me from adding the scale back to the log_alpha in the oone
         log_scales[:, 0] = scale_t0.squeeze(-1)
         # Recursively compute alpha for t=1..T-1
         # Alpha is a tensor representing the log of probs up to time t-1 for each state
@@ -396,7 +397,7 @@ class GaussianHMM(nn.Module):
 
         return log_xi
 
-    def baum_welch(self, X, T, num_iterations=150, threshold=1e-4) -> str:
+    def baum_welch(self, X, T, mean, std, num_iterations=150, threshold=1e-4) -> str:
         """
         X (batch_size, T, D): A batch of observation sequences.
         T (List[int] or Tensor): Lengths of each observation sequence.
@@ -417,6 +418,9 @@ class GaussianHMM(nn.Module):
         if next(self.parameters()).is_cuda:
             X = X.to(next(self.parameters()).device)
             T = T.to(next(self.parameters()).device)
+
+            mean = mean.to(next(self.parameters()).device)
+            std = std.to(next(self.parameters()).device)
 
         prev_log_likelihood = -float("inf")
 
@@ -505,6 +509,7 @@ class GaussianHMM(nn.Module):
             )  # shape: (batch_size, N, D, D)
             # print("New_covariance shape: ", new_covariance.shape)
 
+            # TODO: Need to handle
             new_covariance_sum = new_covariance.sum(dim=0)  # shape: (N, D, D)
             # Ensuring strictly positive definite for covariance avg
             jitter = 1e-4 * torch.eye(
@@ -520,8 +525,8 @@ class GaussianHMM(nn.Module):
             )
             log_likelihoods.append(new_log_likelihood)
 
-            if abs(new_log_likelihood - prev_log_likelihood) < threshold:
-                break
+            # if abs(new_log_likelihood - prev_log_likelihood) < threshold:
+            #     break
 
             prev_log_likelihood = new_log_likelihood
 
@@ -530,6 +535,7 @@ class GaussianHMM(nn.Module):
         prediction = self.forecast_observation(
             next_state_probs, self.emission_model.means
         )
+        prediction = prediction * std.unsqueeze(0) + mean.unsqueeze(0)
         overall_mean = np.mean(log_likelihoods)
         plt.figure(figsize=(8, 6))
         plt.plot(log_likelihoods, marker="o", label="Mean Log-Likelihood")
@@ -557,25 +563,38 @@ class GaussianHMM(nn.Module):
 
         Returns next_state_probs (batch_size, n_states) representing the forecast state distribution for time T+1.
         """
-        batch_size = log_alpha.shape[0]
+        batch_size, T_max, _ = log_alpha.shape
+
+        # for t in range(T_max):
+        #     probs_t = log_alpha[:, t, :].exp()
+        #     sum_probs_t = probs_t.sum(dim=-1)
+        #     print(sum_probs_t)
+        # Log scales is (batch_size, max_time )
 
         batch_indices = torch.arange(batch_size)
         final_log_alpha = log_alpha[
             batch_indices, T - 1, :
         ]  # Shape: (batch_size, n_states)
+        # Just going to find the sum of the final_log_alpha in order to see if they add up to
         # TODO: REvisit
-        sum_of_scales = torch.zeros(
-            batch_size, dtype=torch.float, device=next(self.parameters()).device
-        )
-        for b in range(batch_size):
-            sum_of_scales[b] = torch.sum(log_scales[b, : T[b]])
+        # sum_of_scales = torch.zeros(
+        #     batch_size, dtype=torch.float, device=next(self.parameters()).device
+        # )
+        # for b in range(batch_size):
+        #     sum_of_scales[b] = torch.sum(log_scales[b, : T[b]])
+        # row_sums = self.transition_model.unnormalized_transition_matrix.exp().sum(
+        #     dim=-1
+        # )
+        #
+        # # Print or inspect row_sums:
+        # print("Row sums after exponentiation:", row_sums)
+        #
+        # TODO: Currently, when adding the sum of scales factor to the final log prob, it creates large (-1000) negative numbers.
 
-        final_log_probs = sum_of_scales.unsqueeze(1) + final_log_alpha
-
-        final_probs = final_log_probs.exp()  # Shape: (batch_size, n_states)
+        final_probs = final_log_alpha.exp()  # Shape: (batch_size, n_states)
 
         next_state_probs = torch.matmul(
-            final_probs, self.transition_model.unnormalized_transition_matrix
+            final_probs, self.transition_model.unnormalized_transition_matrix.exp()
         )  # Shape: (batch_size, n_states)
 
         return next_state_probs
