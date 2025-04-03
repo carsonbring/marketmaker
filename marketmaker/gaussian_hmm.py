@@ -408,9 +408,14 @@ class GaussianHMM(nn.Module):
         batch_size, T_max, _ = X.shape
         log_likelihoods = []
 
-        # Initializing means
+        # Initializing means using kmeans++
         # TODO: Change to k-Means
+
+        # Flattens the batches and then selects self.num_states random indices
         x_flat = X.float().reshape(-1, X.shape[-1])
+        x_shape = x_flat.shape
+        print(x_shape)
+
         indices = torch.randperm(x_flat.shape[0])[: self.num_states]
         initial_means = x_flat[indices]
         self.emission_model.means.data.copy_(initial_means)
