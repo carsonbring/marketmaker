@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as func
 import matplotlib.pyplot as plt
 import numpy as np
+from .utils import kmeans
 
 
 def log_domain_matmul(log_A, log_B):
@@ -234,7 +235,7 @@ class GaussianHMM(nn.Module):
         sum_of_scales = torch.zeros_like(T, dtype=torch.float)
         for b in range(batch_size):
             sum_of_scales[b] = torch.sum(log_scales[b, : T[b]])
-        final_log_prob = torch.logsumexp(final_log_alpha, dim=1)
+        final_log_prob = torch.logsumexp(final_log_alpha, dim=1) + sum_of_scales
 
         return final_log_prob
 
@@ -405,20 +406,18 @@ class GaussianHMM(nn.Module):
 
         """
 
-        batch_size, T_max, _ = X.shape
+        batch_size, T_max, D = X.shape
         log_likelihoods = []
 
         # Initializing means using kmeans++
         # TODO: Change to k-Means
-
+        #
         # Flattens the batches and then selects self.num_states random indices
         x_flat = X.float().reshape(-1, X.shape[-1])
         x_shape = x_flat.shape
         print(x_shape)
 
-        indices = torch.randperm(x_flat.shape[0])[: self.num_states]
-        initial_means = x_flat[indices]
-        self.emission_model.means.data.copy_(initial_means)
+        self.emission_model.means.data.copy_(kmeans(x_flat, self.num_states))
 
         if next(self.parameters()).is_cuda:
             X = X.to(next(self.parameters()).device)
@@ -426,8 +425,6 @@ class GaussianHMM(nn.Module):
 
             mean = mean.to(next(self.parameters()).device)
             std = std.to(next(self.parameters()).device)
-
-        prev_log_likelihood = -float("inf")
 
         for i in range(num_iterations):
             log_alpha, log_scales = self.forward(X, T)
@@ -476,6 +473,11 @@ class GaussianHMM(nn.Module):
 
             log_xi_sum = torch.logsumexp(torch.logsumexp(masked_xi, dim=1), dim=0)
             log_gamma_sum = torch.logsumexp(torch.logsumexp(masked_gamma, dim=1), dim=0)
+
+            # FIX: ALL MEANS ARE CONVERGING TO THE SAME ACROSS ALL HIDDEN STATES
+            # FIX time masks for both xi and gamma
+
+            # TODO: Updating this transition matrix is causing state collapse.
             self.transition_model.unnormalized_transition_matrix.data.copy_(
                 log_xi_sum - log_gamma_sum.unsqueeze(1)
             )
@@ -496,6 +498,7 @@ class GaussianHMM(nn.Module):
             weight_total = masked_gamma.sum(dim=1)  # (batch_size, N, 1)
             new_means = weighted_sum.sum(dim=0) / weight_total.sum(dim=0)
 
+            # TODO: Updating these means are causing state collapse
             self.emission_model.means.data.copy_(new_means)
 
             delta = X.unsqueeze(2) - self.emission_model.means.unsqueeze(
@@ -530,12 +533,16 @@ class GaussianHMM(nn.Module):
             )
             log_likelihoods.append(new_log_likelihood)
 
+            print("State occupancies:", torch.exp(log_gamma).mean(dim=(0, 1)))
+
             # if abs(new_log_likelihood - prev_log_likelihood) < threshold:
             #     break
 
             prev_log_likelihood = new_log_likelihood
 
         next_state_probs = self.one_step_ahead_forecast(log_alpha, log_scales, T)  # pyright:ignore
+
+        print("MEANS", self.emission_model.means)
 
         prediction = self.forecast_observation(
             next_state_probs, self.emission_model.means

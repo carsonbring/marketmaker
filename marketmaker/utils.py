@@ -5,11 +5,12 @@ import sys
 import torch
 
 
-# Needs to be euclidean distance since we have multiple dimensions
+# euclidean distance
 def distance(p1, p2):
-    return np.sqrt(np.sum((p1 - p2) ** 2))
+    return torch.cdist(p1, p2)
 
 
+# deterministic kmeans
 def kmeans(data, k):
     """
     data: IntTensor of shape (sample_states, D)
@@ -17,23 +18,21 @@ def kmeans(data, k):
     Returns: Vector with the centroids
     """
 
-    num_vectors, dimensions = data.shape
-    # So the plan is to set the distances for each centroid to infinity and
-    # then find the minimum distance along dim=0.
-    # Then I will be able to find the new centroid based on finding the maximum
-    # out of these minimums, which will be coallated into a new tensor
-    # using gather
-    # Finally I will then be able to to take the index of the maximum to find
-    # the next centroid.
-    # The centroids will be stored in a tensor with the shape (k, dimensions)
+    num_vectors = data.shape[0]
 
-    distance_tensor = data.clone().detach()
-    distance_tensor = distance_tensor.unsqueeze(0).reshape(k, -1, -1)
-    torch.full((k, num_vectors, dimensions), -
-               float("inf"), dtype=torch.float32)
+    distance_tensor = torch.full((k, num_vectors), float("inf"), dtype=torch.float32)
+    centroid_index = torch.randint(0, num_vectors, (1,))
+    centroid_vector = data[centroid_index]
+    centroid_tensor = centroid_vector
 
-    # nothing yet
-    for i in range(k):
-        centroid = torch.randint(0, num_vectors, (1,))
-        # append each distance into a single tensor and then take the min of a vector?
-        # We then take the original index of highest distance vector
+    for _ in range(k - 1):
+        distance_tensor = distance(centroid_tensor, data)
+        _, max_index = distance_tensor.min(dim=0).values.max(dim=0)  # pyright: ignore
+        print(f"DEBUG: centroid_tensor shape = {centroid_tensor}")
+        print(f"DEBUG: new_centroid_to_add shape = {data[max_index].unsqueeze(0)}")
+        centroid_tensor = torch.cat(
+            (centroid_tensor, data[max_index].unsqueeze(0)), dim=0
+        )
+    print("Centroids", centroid_tensor)
+
+    return centroid_tensor
